@@ -1,0 +1,40 @@
+name: Trade watchlist snapshot
+
+# Hourly, independent of any local PC - this is the actual "stündliches
+# Tracking" the watchlist needs. Only stdlib deps (see poe2tool/trade.py),
+# so no pip install step: keeps the job fast and avoids poe2scout getting
+# hammered with a full dependency resolve every hour.
+on:
+  schedule:
+    - cron: "7 * * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: poe2-db-write
+  cancel-in-progress: false
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Trade collect
+        env:
+          CONTACT_EMAIL: ${{ secrets.CONTACT_EMAIL }}
+        run: python -m poe2tool trade collect
+
+      - name: Commit snapshot if the DB changed
+        run: |
+          git config user.name "poe2-watchlist-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add data/poe2.db
+          git diff --cached --quiet || git commit -m "Trade watchlist snapshot $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          git push

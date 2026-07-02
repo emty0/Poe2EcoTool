@@ -1,0 +1,7 @@
+.env
+__pycache__/
+*.pyc
+*.log
+data/*.db-wal
+data/*.db-shm
+data/best_investments_*.csv

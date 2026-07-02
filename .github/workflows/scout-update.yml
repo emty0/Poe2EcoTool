@@ -1,0 +1,45 @@
+name: poe2scout data refresh
+
+# Keeps the full item price history (and the analyze ranking) fresh without
+# a local PC. Runs less often than the trade-watchlist job on purpose:
+# poe2scout uniques only get ~2 new price points/day, so hourly would just
+# hit their API for nothing.
+on:
+  schedule:
+    - cron: "23 */6 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: poe2-db-write
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - run: pip install -r requirements.txt
+
+      - name: Update price history
+        env:
+          CONTACT_EMAIL: ${{ secrets.CONTACT_EMAIL }}
+        run: python -m poe2tool collect --update
+
+      - name: Recompute analysis + ranking
+        run: python -m poe2tool analyze
+
+      - name: Commit refreshed data
+        run: |
+          git config user.name "poe2-scout-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add data/poe2.db
+          git diff --cached --quiet || git commit -m "poe2scout data refresh $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          git push
