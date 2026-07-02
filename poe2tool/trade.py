@@ -108,15 +108,17 @@ class TradeClient:
 # --------------------------------------------------------------------------
 
 def parse_search_ref(ref: str, default_league: str | None) -> tuple[str, str]:
-    """Accepts a full trade URL or a bare search id -> (league, search_id)."""
+    """Accepts a full trade URL or a bare search id -> (league, search_id).
+    Raises ValueError (not SystemExit - callers include the dashboard, where
+    an uncaught SystemExit would take the whole app process down)."""
     if "/" in ref:
         parts = [p for p in urllib.parse.urlparse(ref).path.split("/") if p]
         # .../trade2/search/poe2/{league}/{id}
         if len(parts) >= 2:
             return urllib.parse.unquote(parts[-2]), parts[-1]
-        raise SystemExit(f"Could not parse trade URL: {ref}")
+        raise ValueError(f"Could not parse trade URL: {ref}")
     if not default_league:
-        raise SystemExit("Bare search id given but no league in the DB yet - "
+        raise ValueError("Bare search id given but no league in the DB yet - "
                          "run `collect` once or pass the full trade URL.")
     return default_league, ref
 
@@ -135,10 +137,18 @@ def auto_label(query: dict) -> str:
     return label + suffix
 
 
-def add_search(db_path: str, ref: str, label: str | None = None) -> None:
+def add_search(db_path: str, ref: str, label: str | None = None) -> str:
+    """Register a trade URL/search id pasted by the user (dashboard or CLI).
+    Returns a status message instead of raising for anything short of a
+    programming error, so the dashboard can show it with st.success/st.error
+    without a page crash."""
     con = db.connect(db_path)
-    league, search_id = parse_search_ref(ref, db.get_meta(con, "league"))
-    query = TradeClient().saved_query(league, search_id)
+    try:
+        league, search_id = parse_search_ref(ref, db.get_meta(con, "league"))
+        query = TradeClient().saved_query(league, search_id)
+    except (ValueError, RuntimeError, urllib.error.HTTPError) as e:
+        con.close()
+        return f"Konnte Suche nicht laden: {e}"
     final_label = label or auto_label(query)
     con.execute(
         "INSERT INTO trade_searches(search_id, label, league, query_json, active, added_ts) "
@@ -149,7 +159,7 @@ def add_search(db_path: str, ref: str, label: str | None = None) -> None:
     )
     con.commit()
     con.close()
-    print(f"Watching: {final_label} ({search_id}, league {league})")
+    return f"Watching: {final_label} ({search_id}, league {league})"
 
 
 def list_searches(db_path: str) -> None:
@@ -175,6 +185,24 @@ def remove_search(db_path: str, ref: str) -> None:
     con.commit()
     con.close()
     print(f"{n} search(es) paused (snapshots are kept)." if n else f"No match for {ref!r}.")
+
+
+def delete_searches(db_path: str, search_ids: list[str]) -> int:
+    """Permanently remove searches + their recorded snapshots (unlike
+    remove_search/pausing, this actually drops the history). Safe even if a
+    favorite still points at the deleted label: set_tracking() re-creates the
+    search from scratch the next time tracking is switched back on."""
+    if not search_ids:
+        return 0
+    con = db.connect(db_path)
+    placeholders = ",".join("?" * len(search_ids))
+    con.execute(f"DELETE FROM trade_snapshots WHERE search_id IN ({placeholders})",
+               search_ids)
+    n = con.execute(f"DELETE FROM trade_searches WHERE search_id IN ({placeholders})",
+                    search_ids).rowcount
+    con.commit()
+    con.close()
+    return n
 
 
 # flag name -> (trade2 misc_filters id, label tag for yes, label tag for no)
@@ -206,6 +234,51 @@ def flag_label(item_name: str, flags: dict | None) -> str:
             tags.append(no_tag)
     return (f"{item_name} [trade: {'+'.join(tags)}]" if tags
             else f"{item_name} [trade]")
+
+
+def trade_url(league: str, search_id: str) -> str:
+    """Browser-facing (not API) URL for a saved search - what a human clicks.
+    Mirrors the shape of the URLs pathofexile.com itself hands out."""
+    return f"https://www.pathofexile.com/trade2/search/poe2/{urllib.parse.quote(league)}/{search_id}"
+
+
+def existing_trade_url(db_path: str, item_id: int) -> str | None:
+    """Fast, API-free lookup: reuse any trade_searches row already created
+    for this item's name - via favoriting, or a previous 'open trade' click -
+    instead of minting a fresh search (and burning an API call) every time
+    the detail page loads. Matches by label prefix, so it finds any flag
+    variant; picks the most recently added one."""
+    con = db.connect(db_path)
+    item = con.execute("SELECT name FROM items WHERE item_id=?", (item_id,)).fetchone()
+    if not item:
+        con.close()
+        return None
+    row = con.execute(
+        "SELECT search_id, league FROM trade_searches "
+        "WHERE label = ? OR label LIKE ? ORDER BY added_ts DESC LIMIT 1",
+        (f"{item['name']} [trade]", f"{item['name']} [trade:%"),
+    ).fetchone()
+    con.close()
+    return trade_url(row["league"], row["search_id"]) if row else None
+
+
+def create_default_trade_url(db_path: str, item_id: int) -> tuple[str | None, str]:
+    """One-off 'any flags' search for items with no existing watch yet, so
+    the dashboard's 'open in trade' button has a URL to point at. Reuses
+    add_item_search's dedup/creation logic; returns (url or None, status msg)."""
+    flags = {"identified": "any", "corrupted": "any", "unrevealed": "any"}
+    con = db.connect(db_path)
+    row = con.execute("SELECT name FROM items WHERE item_id=?", (item_id,)).fetchone()
+    con.close()
+    if not row:
+        return None, f"item {item_id} not found"
+    label = flag_label(row["name"], flags)
+    msg = add_item_search(db_path, item_id, flags)
+    con = db.connect(db_path)
+    ts = con.execute("SELECT search_id, league FROM trade_searches WHERE label=?",
+                     (label,)).fetchone()
+    con.close()
+    return (trade_url(ts["league"], ts["search_id"]), msg) if ts else (None, msg)
 
 
 def add_item_search(db_path: str, item_id: int, flags: dict | None = None) -> str:
@@ -241,15 +314,25 @@ def add_item_search(db_path: str, item_id: int, flags: dict | None = None) -> st
         query = {"type": row["name"], "status": {"option": "securable"}}
     if misc:
         query["filters"] = {"misc_filters": {"filters": misc}}
-    result = client.search(league, query)
-    if not result.get("total"):
-        # fallback: unique base types occasionally shift -> match by name only
+    try:
+        result = client.search(league, query)
+    except urllib.error.HTTPError as e:
+        con.close()
+        return f"trade API error for {label!r} ({e.code}) - not added"
+    # fallback: unique base types occasionally shift -> retry by name only.
+    # Only meaningful for uniques (row["type"] set) - the primary query for
+    # currencies already IS name-based ({"type": name}), and the trade API
+    # rejects a currency-category search with just "name" (400 Bad Request).
+    if not result.get("total") and row["type"]:
         fallback = {"name": row["name"], "status": {"option": "securable"}}
         if misc:
             fallback["filters"] = {"misc_filters": {"filters": misc}}
-        alt = client.search(league, fallback)
-        if alt.get("total"):
-            query, result = fallback, alt
+        try:
+            alt = client.search(league, fallback)
+            if alt.get("total"):
+                query, result = fallback, alt
+        except urllib.error.HTTPError:
+            pass  # keep the original (empty) result, fall through below
     if not result.get("total"):
         con.close()
         return (f"no live listings found for {label!r} - not added "

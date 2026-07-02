@@ -181,13 +181,19 @@ def run_analysis(db_path: str = db.DEFAULT_DB, csv_path: str | None = None,
         raise SystemExit("No price points in the DB yet - run `collect` first.")
 
     divine = reference_series(points, items, "divine")
+    chaos = reference_series(points, items, "chaos")
     if divine is None:
         print("WARNING: no Divine history in the DB (partial collect?). "
-              "Only the exalted denomination will be computed.")
+              "The divine denomination will be skipped.")
+    if chaos is None:
+        print("WARNING: no Chaos history in the DB (partial collect?). "
+              "The chaos denomination will be skipped.")
 
     denoms = {"exalted": None}
     if divine is not None:
         denoms["divine"] = divine
+    if chaos is not None:
+        denoms["chaos"] = chaos
 
     all_rows = []
     for denom, ref in denoms.items():

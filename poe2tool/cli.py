@@ -101,7 +101,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "trade":
         from . import trade
         if args.trade_cmd == "add":
-            trade.add_search(args.db, args.ref, args.label)
+            print(trade.add_search(args.db, args.ref, args.label))
         elif args.trade_cmd == "add-item":
             import sqlite3
             from . import db as dbmod

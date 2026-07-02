@@ -59,14 +59,14 @@ def load_item_points(mtime: float, item_id: int, denom: str) -> pd.DataFrame:
         "WHERE item_id=? AND price_exalted > 0 ORDER BY ts", con, params=(item_id,))
     pts["ts"] = pd.to_datetime(pts["ts"], utc=True)
     ref = None
-    if denom == "divine":
+    if denom != "exalted":
         items = pd.read_sql_query(
             "SELECT item_id, name, category, api_id, type FROM items", con)
         all_ref = pd.read_sql_query(
             "SELECT item_id, ts, price_exalted, quantity FROM price_points "
             "WHERE price_exalted > 0", con)
         all_ref["ts"] = pd.to_datetime(all_ref["ts"], utc=True)
-        ref = reference_series(all_ref, items, "divine")
+        ref = reference_series(all_ref, items, denom)
     con.close()
     return to_denom(pts, ref)
 
@@ -82,7 +82,7 @@ def category_index(mtime: float, denom: str) -> pd.DataFrame:
         "SELECT item_id, name, category, api_id, type FROM items", con)
     con.close()
     pts["ts"] = pd.to_datetime(pts["ts"], utc=True)
-    ref = reference_series(pts, items, "divine") if denom == "divine" else None
+    ref = reference_series(pts, items, denom) if denom != "exalted" else None
 
     # per item: normalized series on a common 6h grid, forward-filled, so the
     # per-bucket median is not distorted by items dropping in and out
@@ -123,12 +123,64 @@ def category_index(mtime: float, denom: str) -> pd.DataFrame:
 
 
 @st.cache_data(show_spinner=False)
-def divine_rate_series(mtime: float) -> pd.DataFrame:
+def short_term_momentum(mtime: float, denom: str, hours: int = 24) -> pd.DataFrame:
+    """Recent momentum per item: latest liquid price vs. the liquid price
+    ~`hours` ago. Only a 5-day window is pulled (enough for a 24h lookback
+    with margin), so this stays cheap even with 500k+ total price points.
+    Items with too few recent/liquid points or too small a real time gap
+    around the lookback point are dropped rather than returning noise."""
+    con = sqlite3.connect(DB_PATH)
+    pts = pd.read_sql_query(
+        "SELECT item_id, ts, price_exalted, quantity FROM price_points "
+        "WHERE price_exalted > 0 AND ts >= datetime('now', '-5 days')", con)
+    items = pd.read_sql_query(
+        "SELECT item_id, name, category, api_id, type FROM items", con)
+    con.close()
+    if pts.empty:
+        return pd.DataFrame()
+    pts["ts"] = pd.to_datetime(pts["ts"], utc=True)
+    ref = reference_series(pts, items, denom) if denom != "exalted" else None
+
+    now = pts["ts"].max()
+    target_ref_ts = now - pd.Timedelta(hours=hours)
+    rows = []
+    for item_id, g in pts.groupby("item_id"):
+        conv = to_denom(g, ref).sort_values("ts")
+        med_qty = conv["quantity"].median()
+        liquid = conv[conv["quantity"] >= max(2, 0.1 * (med_qty or 0))]
+        if len(liquid) >= 4:
+            conv = liquid
+        if len(conv) < 4:
+            continue
+        latest = conv.iloc[-1]
+        before = conv[conv["ts"] <= target_ref_ts]
+        if before.empty:
+            continue
+        ref_point = before.iloc[-1]
+        gap_hours = (latest["ts"] - ref_point["ts"]).total_seconds() / 3600
+        if gap_hours < hours * 0.5 or ref_point["price"] <= 0:
+            continue
+        rows.append({
+            "item_id": int(item_id), "price_ref": ref_point["price"],
+            "price_now": latest["price"],
+            "pct_change": latest["price"] / ref_point["price"] - 1,
+            "liquidity": med_qty, "illiquid": med_qty < 10 or len(conv) < 4,
+        })
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows).merge(items, on="item_id")
+
+
+@st.cache_data(show_spinner=False)
+def rate_series(mtime: float, api_id: str) -> pd.DataFrame:
+    """Exchange rate history of a reference currency (divine/chaos) in
+    Exalted, used to convert trade_snapshots (stored in Exalted) into
+    whichever denomination is selected."""
     con = sqlite3.connect(DB_PATH)
     df = pd.read_sql_query(
         "SELECT p.ts, p.price_exalted AS ref_price FROM price_points p "
-        "JOIN items i ON i.item_id = p.item_id WHERE i.api_id='divine' "
-        "ORDER BY p.ts", con)
+        "JOIN items i ON i.item_id = p.item_id WHERE i.api_id=? "
+        "ORDER BY p.ts", con, params=(api_id,))
     con.close()
     df["ts"] = pd.to_datetime(df["ts"], utc=True)
     return df
@@ -256,8 +308,11 @@ def load_watchlist(mtime: float):
     return searches, snaps
 
 
+UNIT_BY_DENOM = {"divine": "div", "exalted": "ex", "chaos": "cha"}
+
+
 def fmt_price(denom: str):
-    return st.column_config.NumberColumn(format="%.4g " + ("div" if denom == "divine" else "ex"))
+    return st.column_config.NumberColumn(format="%.4g " + UNIT_BY_DENOM[denom])
 
 
 def pct_col():
@@ -297,6 +352,12 @@ if qp_item and qp_item != str(st.session_state.get("_qp_item_handled")):
     except ValueError:
         pass
 
+qp_trade = st.query_params.get("trade")
+if qp_trade and qp_trade != st.session_state.get("_qp_trade_handled"):
+    st.session_state["_qp_trade_handled"] = qp_trade
+    st.session_state["trade_detail_search_id"] = qp_trade
+    st.session_state["page"] = "Trade-Detail"
+
 
 def item_link_col(df: pd.DataFrame) -> pd.DataFrame:
     """Prepend a link column (?item=<id>&n=<name>) rendered as a blue link."""
@@ -306,14 +367,26 @@ def item_link_col(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def trade_link_col(df: pd.DataFrame) -> pd.DataFrame:
+    """Prepend a link column (?trade=<search_id>&n=<label>) for the
+    Trade-Suchen table, mirroring item_link_col for poe2scout items."""
+    out = df.copy()
+    out.insert(0, "Suche", "?trade=" + out["search_id"].astype(str)
+               + "&n=" + out["label"].astype(str))
+    return out
+
+
 LINK_COL = st.column_config.LinkColumn("Item", display_text=r"[?&]n=(.*)$",
                                        help="Klick öffnet die Detail-Seite")
+TRADE_LINK_COL = st.column_config.LinkColumn("Suche", display_text=r"[?&]n=(.*)$",
+                                             help="Klick öffnet die Detail-Seite")
 
 
 st.sidebar.title("PoE2 Investment Analyzer")
 st.sidebar.caption(f"Liga: **{league}**")
 page = st.sidebar.radio("Seite", ["Overview", "Item-Detail", "Best Investments",
-                                  "Kategorien", "Watchlist"], key="page")
+                                  "Kategorien", "Watchlist", "Trade-Detail",
+                                  "🔥 Hot"], key="page")
 
 # Filter-Widgets (flt_*) über Seitenwechsel am Leben halten: Streamlit räumt
 # Widget-State auf, sobald das Widget einen Run lang nicht gerendert wird;
@@ -322,11 +395,11 @@ for _k in [k for k in st.session_state if k.startswith("flt_")]:
     st.session_state[_k] = st.session_state[_k]
 
 # merken, von welcher Seite man zuletzt kam -> Ziel des Zurück-Buttons
-if page != "Item-Detail":
+if page not in ("Item-Detail", "Trade-Detail"):
     st.session_state["_back_page"] = page
-denom = st.sidebar.radio("Denominierung", ["divine", "exalted"], horizontal=True,
-                         format_func=lambda d: d.capitalize())
-unit = "div" if denom == "divine" else "ex"
+denom = st.sidebar.radio("Denominierung", ["divine", "exalted", "chaos"],
+                         horizontal=True, format_func=lambda d: d.capitalize())
+unit = UNIT_BY_DENOM[denom]
 
 st.sidebar.divider()
 st.sidebar.caption(f"Neuester Datenpunkt: `{freshness or '-'}`")
@@ -395,6 +468,21 @@ elif page == "Item-Detail":
     row = a_sorted.iloc[list(names).index(choice)]
     item_id = int(row["item_id"])
     st.session_state["detail_item_id"] = item_id
+
+    from poe2tool.trade import existing_trade_url
+    trade_link = existing_trade_url(DB_PATH, item_id)
+    if trade_link:
+        st.link_button("🔗 Auf offiziellem Trade-Markt öffnen", trade_link)
+    elif st.button("🔗 Trade-Suche erstellen & öffnen",
+                   help="Legt einmalig eine Trade-Suche an (Flags: Any) und "
+                        "öffnet sie danach im Browser."):
+        from poe2tool.trade import create_default_trade_url
+        with st.spinner("Erstelle Trade-Suche ..."):
+            url, msg = create_default_trade_url(DB_PATH, item_id)
+        if url:
+            st.rerun()
+        else:
+            st.warning(msg)
 
     pts = load_item_points(mtime, item_id, denom)
     fig = go.Figure()
@@ -598,6 +686,24 @@ elif page == "Watchlist":
     st.subheader("Trade-Suchen (eigene Aufzeichnung)")
     if "_trade_msg" in st.session_state:
         st.success("  \n".join(st.session_state.pop("_trade_msg")))
+    with st.expander("🔗 Eigenen Trade-Link hinzufügen"):
+        st.caption("Für Suchen, die sich nicht aus einem Item-Namen "
+                   "ableiten lassen (Stat-Filter, Socket-Zahl, Mod-Kombos "
+                   "...): Link von pathofexile.com/trade2/search/... "
+                   "hier einfügen, z. B. für eine gespeicherte Suche.")
+        link_url = st.text_input("Trade-URL oder Such-ID", key="wl_link_url")
+        link_label = st.text_input("Label (optional, sonst automatisch)",
+                                   key="wl_link_label")
+        if st.button("🔗 Hinzufügen") and link_url.strip():
+            from poe2tool.trade import add_search
+            with st.spinner("Lade Suche von der Trade-API ..."):
+                msg = add_search(DB_PATH, link_url.strip(),
+                                 link_label.strip() or None)
+            if msg.startswith("Watching:"):
+                st.session_state["_trade_msg"] = [msg]
+                st.rerun()
+            else:
+                st.error(msg)
     if st.button("Jetzt Daten holen",
                  help="Holt sofort einen Snapshot aller aktiven Suchen von der "
                       "offiziellen Trade-API - unabhängig vom stündlichen Task."):
@@ -615,9 +721,9 @@ elif page == "Watchlist":
         st.stop()
 
     snaps = snaps.merge(searches[["search_id", "label"]], on="search_id")
-    if denom == "divine":
-        div = divine_rate_series(mtime)
-        snaps = pd.merge_asof(snaps.sort_values("ts"), div, on="ts",
+    if denom != "exalted":
+        rates = rate_series(mtime, denom)
+        snaps = pd.merge_asof(snaps.sort_values("ts"), rates, on="ts",
                               direction="nearest")
         snaps["min_p"] = snaps["min_exalted"] / snaps["ref_price"]
         snaps["med10"] = snaps["med10_exalted"] / snaps["ref_price"]
@@ -625,13 +731,42 @@ elif page == "Watchlist":
         snaps["min_p"] = snaps["min_exalted"]
         snaps["med10"] = snaps["med10_exalted"]
 
-    latest = (snaps.sort_values("ts").groupby("search_id").tail(1)
-              [["label", "ts", "total", "min_p", "med10"]]
-              .rename(columns={"total": "Listings", "min_p": "Min",
-                               "med10": "Median (10 günstigste)"}))
-    st.dataframe(latest, column_config={
-        "Min": fmt_price(denom), "Median (10 günstigste)": fmt_price(denom),
-    }, use_container_width=True, hide_index=True)
+    latest_snap = (snaps.sort_values("ts").groupby("search_id").tail(1)
+                  [["search_id", "ts", "total", "min_p", "med10"]])
+    # left join on all searches (not just ones with a snapshot yet), so
+    # freshly-added or paused-with-zero-snapshots searches are deletable too
+    table = searches.merge(latest_snap, on="search_id", how="left")
+    table["active"] = table["active"].astype(bool)
+    table["Löschen"] = False
+    show = trade_link_col(table).rename(columns={
+        "active": "Aktiv", "ts": "Letzter Snapshot",
+        "total": "Listings", "min_p": "Min", "med10": "Median (10 günstigste)",
+    })[["Suche", "Aktiv", "Letzter Snapshot", "Listings", "Min",
+        "Median (10 günstigste)", "Löschen"]]
+
+    st.session_state.setdefault("_trade_editor_ver", 0)
+    edited = st.data_editor(
+        show,
+        column_config={
+            "Suche": TRADE_LINK_COL,
+            "Min": fmt_price(denom), "Median (10 günstigste)": fmt_price(denom),
+            "Löschen": st.column_config.CheckboxColumn(
+                help="Suche + alle aufgezeichneten Snapshots endgültig löschen"),
+        },
+        disabled=["Suche", "Aktiv", "Letzter Snapshot", "Listings", "Min",
+                 "Median (10 günstigste)"],
+        use_container_width=True, hide_index=True,
+        height=min(38 * (len(show) + 1) + 3, 500),
+        key=f"trade_editor_{st.session_state['_trade_editor_ver']}",
+    )
+    to_delete = table.loc[edited["Löschen"], "search_id"].tolist()
+    if to_delete and st.button(f"🗑 {len(to_delete)} ausgewählte Suche(n) endgültig löschen"):
+        from poe2tool.trade import delete_searches
+        n = delete_searches(DB_PATH, to_delete)
+        st.session_state["_trade_msg"] = [
+            f"{n} Suche(n) gelöscht (inkl. aufgezeichneter Snapshots)."]
+        st.session_state["_trade_editor_ver"] += 1
+        st.rerun()
 
     sel = st.multiselect("Suchen im Chart", sorted(searches["label"].unique()),
                          default=sorted(searches["label"].unique()))
@@ -651,3 +786,129 @@ elif page == "Watchlist":
                "gepunktet = günstigstes Listing. Ein Punkt pro Snapshot - "
                "die Historie entsteht ab jetzt durch den stündlichen Task "
                "(`trade_collect.bat`).")
+
+elif page == "Trade-Detail":
+    from poe2tool.trade import trade_url
+
+    back_page = st.session_state.get("_back_page", "Watchlist")
+    if st.button(f"← Zurück zu {back_page}"):
+        st.query_params.clear()
+        st.session_state["_nav_target"] = (back_page, None)
+        st.rerun()
+
+    searches, snaps = load_watchlist(mtime)
+    if searches.empty:
+        st.info("Noch keine Trade-Suchen vorhanden. Auf der Watchlist-Seite "
+                "hinzufügen.")
+        st.stop()
+
+    sid = st.session_state.get("trade_detail_search_id")
+    if sid not in searches["search_id"].values:
+        sid = searches.sort_values("label")["search_id"].iloc[0]
+    st.session_state["trade_detail_search_id"] = sid
+    row = searches[searches["search_id"] == sid].iloc[0]
+
+    st.header(row["label"])
+    st.caption(f"Status: {'aktiv' if row['active'] else 'pausiert'} - "
+               f"Liga: {row['league']}")
+    st.link_button("🔗 Auf offiziellem Trade-Markt öffnen",
+                  trade_url(row["league"], sid))
+
+    own = snaps[snaps["search_id"] == sid].sort_values("ts")
+    if own.empty:
+        st.info("Noch keine Snapshots für diese Suche - warte auf den "
+                "nächsten stündlichen Lauf oder klicke auf der "
+                "Watchlist-Seite auf 'Jetzt Daten holen'.")
+        st.stop()
+
+    if denom != "exalted":
+        rates = rate_series(mtime, denom)
+        own = pd.merge_asof(own, rates, on="ts", direction="nearest")
+        own["min_p"] = own["min_exalted"] / own["ref_price"]
+        own["med10"] = own["med10_exalted"] / own["ref_price"]
+    else:
+        own["min_p"] = own["min_exalted"]
+        own["med10"] = own["med10_exalted"]
+
+    fig = go.Figure()
+    fig.add_trace(go.Bar(x=own["ts"], y=own["total"], name="Listings gesamt",
+                         yaxis="y2", marker_color="rgba(120,120,160,0.3)"))
+    fig.add_trace(go.Scatter(x=own["ts"], y=own["med10"], name=f"Median 10 ({unit})",
+                             mode="lines+markers", line=dict(color="#2b8cbe", width=2)))
+    fig.add_trace(go.Scatter(x=own["ts"], y=own["min_p"], name=f"Min ({unit})",
+                             mode="lines", line=dict(color="#31a354", dash="dot")))
+    fig.update_layout(
+        height=480, yaxis=dict(title=f"Preis ({unit})"),
+        yaxis2=dict(title="Listings", overlaying="y", side="right", showgrid=False),
+        legend=dict(orientation="h"), margin=dict(t=30))
+    st.plotly_chart(fig, use_container_width=True)
+
+    first, last = own.iloc[0], own.iloc[-1]
+    peak_row = own.loc[own["med10"].idxmax()]
+    delta = (f"{(last['med10'] / first['med10'] - 1) * 100:+.1f}%"
+            if pd.notna(first["med10"]) and first["med10"] > 0 else None)
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Erster Snapshot", f"{first['med10']:.4g} {unit}",
+              first["ts"].strftime("%Y-%m-%d %H:%M"))
+    m2.metric("Aktuell", f"{last['med10']:.4g} {unit}", delta)
+    m3.metric("Peak (Median)", f"{peak_row['med10']:.4g} {unit}",
+              peak_row["ts"].strftime("%Y-%m-%d %H:%M"))
+    m4.metric("Snapshots", len(own))
+    st.caption("Median = Median der 10 günstigsten Listings je Snapshot, "
+               "Min = günstigstes Listing. Balken = Gesamtzahl Listings.")
+
+elif page == "🔥 Hot":
+    st.header("🔥 Hot - Buy/Sell Signale")
+    st.caption("Rückblickende Muster, kein Signal für morgen. Kurzfristig = "
+               "Preis jetzt vs. ~24h zuvor (nur liquide Items, aus den "
+               "Rohdaten berechnet). Langfristig = ROI seit Einstieg "
+               "(Liga-Start bis jetzt, aus der Analyse).")
+
+    st.subheader("Kurzfristig (~24h)")
+    with st.spinner("Berechne kurzfristige Trends ..."):
+        mom = short_term_momentum(mtime, denom)
+    if mom.empty:
+        st.info("Noch nicht genug aktuelle Daten für kurzfristige Trends "
+                "(braucht mehrere Preispunkte über mind. ~12h).")
+    else:
+        liquid_mom = mom[~mom["illiquid"]]
+        mom_cfg = {
+            "item": LINK_COL, "price_ref": fmt_price(denom),
+            "price_now": fmt_price(denom), "pct_change": pct_col(),
+        }
+        mom_cols = ["item", "category", "price_ref", "price_now",
+                   "pct_change", "liquidity"]
+        mc1, mc2 = st.columns(2)
+        with mc1:
+            st.markdown("🟢 **Stärkste Anstiege** - Momentum-Käufe, oder "
+                       "Verkaufssignal falls du's schon hältst")
+            top_up = liquid_mom.sort_values("pct_change", ascending=False).head(15)
+            st.dataframe(item_link_col(top_up)[mom_cols], column_config=mom_cfg,
+                        hide_index=True, use_container_width=True, height=460)
+        with mc2:
+            st.markdown("🔴 **Stärkste Rückgänge** - evtl. günstiger "
+                       "Einstieg, oder Verkaufssignal falls weiter fallend")
+            top_down = liquid_mom.sort_values("pct_change", ascending=True).head(15)
+            st.dataframe(item_link_col(top_down)[mom_cols], column_config=mom_cfg,
+                        hide_index=True, use_container_width=True, height=460)
+
+    st.subheader("Langfristig (seit Einstieg)")
+    liquid_a = a[a["illiquid"] == 0]
+    roi_cfg = {
+        "item": LINK_COL, "entry_price": fmt_price(denom),
+        "current_price": fmt_price(denom), "roi_now": pct_col(),
+    }
+    roi_cols = ["item", "category", "entry_price", "current_price",
+               "roi_now", "liquidity"]
+    lc1, lc2 = st.columns(2)
+    with lc1:
+        st.markdown("📈 **Beste langfristige Performer**")
+        top_roi = liquid_a.sort_values("roi_now", ascending=False).head(15)
+        st.dataframe(item_link_col(top_roi)[roi_cols], column_config=roi_cfg,
+                    hide_index=True, use_container_width=True, height=460)
+    with lc2:
+        st.markdown("📉 **Schwächste langfristige Performer** - evtl. "
+                   "Bodenbildung")
+        bottom_roi = liquid_a.sort_values("roi_now", ascending=True).head(15)
+        st.dataframe(item_link_col(bottom_roi)[roi_cols], column_config=roi_cfg,
+                    hide_index=True, use_container_width=True, height=460)
